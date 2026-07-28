@@ -91,6 +91,9 @@ class EncoderInfo:
 class MotorErrorCode:
     disabled = 0x0
     normal = 0x1
+    output_shaft_calibration = 0x3
+    sensor_output = 0x4
+    motor_encoder_calibration = 0x5
     over_voltage = 0x8
     under_voltage = 0x9
     over_current = 0xA
@@ -103,12 +106,15 @@ class MotorErrorCode:
     motor_error_code_dict = {
         normal: "normal",
         disabled: "disabled",
+        output_shaft_calibration: "output-shaft encoder calibration error",
+        sensor_output: "sensor output error",
+        motor_encoder_calibration: "motor encoder calibration error",
         over_voltage: "over voltage",
         under_voltage: "under voltage",
         over_current: "over current",
         mosfet_over_temperature: "mosfet over temperature",
         motor_over_temperature: "motor over temperature",
-        loss_communication: "loss communication",
+        loss_communication: "CAN command watchdog timeout (motor replied)",
         overload: "overload",
     }
     # covert to decimal

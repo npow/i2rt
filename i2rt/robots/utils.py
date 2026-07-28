@@ -595,8 +595,24 @@ class LockFreeCircularBuffer:
         valid_mask = self.timestamps > (current_time - time_window)
         return self.values[valid_mask]
 
+    def clear(self) -> None:
+        """Discard prior samples without reallocating the fixed-size buffer."""
+        self.timestamps.fill(0.0)
+        self.values.fill(0.0)
+        self.write_idx = 0
+
 
 class GripperForceLimiter:
+    # The command convention for all motor grippers is 0 = closed, 1 = open.
+    # A fully-open linear gripper can report a high holding effort at its hard
+    # stop.  Let it back away in a small, time-bounded step before treating that
+    # stale end-stop effort as an object-contact clog.
+    _OPEN_ENDPOINT_THRESHOLD = 0.98
+    _OPEN_ENDPOINT_RELEASE_COMPLETE = 0.95
+    _OPEN_ENDPOINT_RELEASE_STEP = 0.03
+    _OPEN_ENDPOINT_RELEASE_TIMEOUT_S = 0.25
+    _POSITION_EPS = 1e-3
+
     def __init__(
         self,
         max_force: float,
@@ -609,7 +625,9 @@ class GripperForceLimiter:
         self.max_force = max_force
         self.gripper_type = gripper_type
         self._is_clogged = False
+        self._blocked_direction: Optional[float] = None
         self._gripper_adjusted_qpos = None
+        self._open_endpoint_release_started_at: Optional[float] = None
         self._kp = kp
         self._past_gripper_effort_buffer = LockFreeCircularBuffer(maxsize=1000)
         self.average_torque_window = average_torque_window
@@ -620,6 +638,55 @@ class GripperForceLimiter:
         self.gripper_force_torque_map = partial(
             _gripper_force_torque_map,
             gripper_force=self.max_force,
+        )
+
+    def _clear_clogged_state(self) -> None:
+        self._is_clogged = False
+        self._blocked_direction = None
+
+    @staticmethod
+    def _requested_direction(gripper_state: Dict[str, float]) -> float:
+        """Return requested motion direction in the limiter's raw qpos space."""
+        delta = gripper_state["target_qpos"] - gripper_state["current_qpos"]
+        if abs(delta) <= GripperForceLimiter._POSITION_EPS:
+            delta = gripper_state["last_command_qpos"] - gripper_state["current_qpos"]
+        return float(np.sign(delta))
+
+    def _bounded_open_endpoint_release(self, gripper_state: Dict[str, float]) -> Optional[float]:
+        """Return a small retreat command when leaving the fully-open hard stop.
+
+        This avoids carrying a high, stale open-stop effort into a close request.
+        The gate is bounded in stroke and duration; if feedback does not leave
+        the endpoint, ordinary force limiting resumes after the timeout.
+        """
+        current_normalized = float(gripper_state["current_normalized_qpos"])
+        target_normalized = float(gripper_state["target_normalized_qpos"])
+        moving_closed = target_normalized < current_normalized - self._POSITION_EPS
+        now = time.monotonic()
+
+        if self._open_endpoint_release_started_at is not None:
+            release_complete = current_normalized <= self._OPEN_ENDPOINT_RELEASE_COMPLETE
+            release_timed_out = now - self._open_endpoint_release_started_at >= self._OPEN_ENDPOINT_RELEASE_TIMEOUT_S
+            if not moving_closed or release_complete or release_timed_out:
+                self._open_endpoint_release_started_at = None
+                if release_complete:
+                    self._past_gripper_effort_buffer.clear()
+                return None
+        elif current_normalized >= self._OPEN_ENDPOINT_THRESHOLD and moving_closed:
+            self._open_endpoint_release_started_at = now
+        else:
+            return None
+
+        # Do not leave a previous object-contact latch or open-stop effort in
+        # place while commanding this short retreat from the open endpoint.
+        self._clear_clogged_state()
+        self._past_gripper_effort_buffer.clear()
+        self._gripper_adjusted_qpos = gripper_state["current_qpos"]
+
+        normalized_delta = current_normalized - target_normalized
+        fraction = min(1.0, self._OPEN_ENDPOINT_RELEASE_STEP / normalized_delta)
+        return gripper_state["current_qpos"] + fraction * (
+            gripper_state["target_qpos"] - gripper_state["current_qpos"]
         )
 
     def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> float:
@@ -633,14 +700,30 @@ class GripperForceLimiter:
         if self.debug:
             print(f"average_effort: {average_effort}")
 
+        requested_direction = self._requested_direction(gripper_state)
+        normalized_current_qpos = gripper_state["current_normalized_qpos"]
+        normalized_target_qpos = gripper_state["target_normalized_qpos"]
+        requested_close = normalized_target_qpos < normalized_current_qpos - self._POSITION_EPS
         if self._is_clogged:
-            normalized_current_qpos = gripper_state["current_normalized_qpos"]
-            normalized_target_qpos = gripper_state["target_normalized_qpos"]
             # 0 close 1 open
-            if (normalized_current_qpos < normalized_target_qpos) or average_effort < 0.2:  # want to open
-                self._is_clogged = False
-        elif average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
+            reversed_from_blocked_direction = (
+                self._blocked_direction is not None
+                and requested_direction != 0.0
+                and requested_direction * self._blocked_direction < 0.0
+            )
+            if (
+                reversed_from_blocked_direction
+                or (normalized_current_qpos < normalized_target_qpos)
+                or average_effort < 0.2
+            ):  # want to open, reverse, or effort has dissipated
+                self._clear_clogged_state()
+        elif (
+            requested_close
+            and average_effort > self.clog_force_threshold
+            and np.abs(current_speed) < self.clog_speed_threshold
+        ):
             self._is_clogged = True
+            self._blocked_direction = requested_direction if requested_direction != 0.0 else None
 
         if self._is_clogged:
             target_eff = self.gripper_force_torque_map(current_angle=gripper_state["current_qpos"])
@@ -650,6 +733,10 @@ class GripperForceLimiter:
             return None
 
     def update(self, gripper_state: Dict[str, float]) -> None:
+        bounded_release_target = self._bounded_open_endpoint_release(gripper_state)
+        if bounded_release_target is not None:
+            return bounded_release_target
+
         current_ts = time.time()
         self._past_gripper_effort_buffer.put(current_ts, gripper_state["current_eff"])
         target_eff = self.compute_target_gripper_torque(gripper_state)

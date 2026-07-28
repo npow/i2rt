@@ -1,8 +1,14 @@
 import logging
+import os
 import time
 from typing import List, Optional
 
 import can
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - SocketCAN is Linux-only in production.
+    fcntl = None
 
 from i2rt.motor_drivers.utils import ReceiveMode
 
@@ -18,7 +24,31 @@ class CanInterface:
         use_buffered_reader: bool = False,
     ):
         self.channel = channel
-        self.bus = can.interface.Bus(bustype=bustype, channel=channel, bitrate=bitrate)
+        # A CAN socket does not arbitrate ownership at the application level:
+        # two viewers/controllers can both consume replies and send commands.
+        # Refuse a second controller for the same SocketCAN interface.
+        self._channel_lock_fd: Optional[int] = None
+        if bustype == "socketcan" and fcntl is not None:
+            lock_name = channel.replace("/", "_")
+            lock_path = f"/tmp/i2rt-can-{lock_name}.lock"
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(lock_fd)
+                raise RuntimeError(
+                    f"CAN channel {channel!r} is already owned by another i2rt process; "
+                    "stop the other controller/viewer before opening it."
+                ) from None
+            self._channel_lock_fd = lock_fd
+        try:
+            self.bus = can.interface.Bus(bustype=bustype, channel=channel, bitrate=bitrate)
+        except Exception:
+            if self._channel_lock_fd is not None:
+                fcntl.flock(self._channel_lock_fd, fcntl.LOCK_UN)
+                os.close(self._channel_lock_fd)
+                self._channel_lock_fd = None
+            raise
         self.busstate = self.bus.state
         self.name = name
         self.receive_mode = receive_mode
@@ -31,12 +61,39 @@ class CanInterface:
 
     def close(self) -> None:
         """Shut down the CAN bus."""
-        if self.use_buffered_reader:
-            self.notifier.stop()
-        self.bus.shutdown()
+        try:
+            if self.use_buffered_reader:
+                self.notifier.stop()
+            self.bus.shutdown()
+        finally:
+            if self._channel_lock_fd is not None:
+                fcntl.flock(self._channel_lock_fd, fcntl.LOCK_UN)
+                os.close(self._channel_lock_fd)
+                self._channel_lock_fd = None
+
+    def _is_expected_feedback(self, response: can.Message, expected_id: int, motor_id: int) -> bool:
+        """Return true only for a valid feedback frame from ``motor_id``.
+
+        On a multi-motor CAN bus stale feedback and register replies are
+        common.  Matching only arbitration ID is insufficient: the low nibble
+        of feedback byte 0 is the motor ID in the DaMiao MIT protocol.
+        """
+        if response.is_error_frame or response.is_remote_frame:
+            return False
+        if response.arbitration_id != expected_id or len(response.data) != 8:
+            return False
+        if self.receive_mode == ReceiveMode.p16 and (response.data[0] & 0x0F) != motor_id:
+            return False
+        return True
 
     def _send_message_get_response(
-        self, id: int, motor_id: int, data: List[int], max_retry: int = 5, expected_id: Optional[int] = None
+        self,
+        id: int,
+        motor_id: int,
+        data: List[int],
+        max_retry: int = 5,
+        expected_id: Optional[int] = None,
+        response_timeout: float = 0.01,
     ) -> can.Message:
         """Send a message over the CAN bus.
 
@@ -48,19 +105,34 @@ class CanInterface:
             can.Message: The message that was sent.
         """
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
+        if expected_id is None:
+            expected_id = self.receive_mode.get_receive_id(motor_id)
         for _ in range(max_retry):
             try:
-                # logging.info("Sending message: %s at %f", message, time.time())
                 self.bus.send(message)
-                response = self._receive_message(motor_id, timeout=0.01)
-                # logging.info("Received response: %s at %f", response, time.time())
-
-                if expected_id is None:
-                    expected_id = self.receive_mode.get_receive_id(motor_id)
-                if response and (expected_id == response.arbitration_id):
-                    return response
-                self.try_receive_message(id)
-            except (can.CanError, AssertionError) as e:
+                # Keep consuming frames until this transaction's deadline. Do
+                # not discard the valid reply merely because a stale frame
+                # arrived first.
+                deadline = time.monotonic() + response_timeout
+                while time.monotonic() < deadline:
+                    response = self._receive_message(
+                        motor_id,
+                        timeout=min(0.001, max(0.0, deadline - time.monotonic())),
+                        supress_warning=True,
+                    )
+                    if response is None:
+                        continue
+                    if self._is_expected_feedback(response, expected_id, motor_id):
+                        return response
+                    logging.debug(
+                        "Ignoring non-matching CAN frame on %s while waiting for motor %s: "
+                        "arb=0x%x data=%s",
+                        self.channel,
+                        motor_id,
+                        response.arbitration_id,
+                        bytes(response.data).hex(),
+                    )
+            except can.CanError as e:
                 logging.warning(e)
                 logging.warning(
                     "\033[91m"

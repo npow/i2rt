@@ -1,7 +1,7 @@
 import logging
 import xml.etree.ElementTree as ET
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -22,6 +22,98 @@ from i2rt.robots.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# These are motor-joint endpoints measured at the physical end stops.  The
+# left gripper's useful stroke crosses a 2*pi branch, so do not pre-normalize
+# either value.  JointMapper intentionally accepts either ordering: command
+# 0 maps to the first (closed) endpoint and command 1 maps to the second
+# (open) endpoint.
+_LEFT_LINEAR_4310_RAW_LIMITS = np.array([6.325055, 1.234264], dtype=float)
+_RIGHT_LINEAR_4310_RAW_LIMITS = np.array([1.235790, 6.322004], dtype=float)
+_GRIPPER_BRANCH_TOLERANCE_RAD = 0.25
+
+
+def _calibrated_gripper_limits(channel: str) -> Optional[np.ndarray]:
+    """Return a copy of measured raw gripper endpoints for a CAN channel.
+
+    These values live in the same motor coordinate used by ``DMChain`` before
+    its software offsets.  Keeping the calibration in that stable coordinate
+    makes it independent of which gripper endpoint happens to be present when
+    the process starts.
+    """
+    limits = {
+        "can_left": _LEFT_LINEAR_4310_RAW_LIMITS,
+        "can_right": _RIGHT_LINEAR_4310_RAW_LIMITS,
+    }.get(channel)
+    return None if limits is None else limits.copy()
+
+
+def _startup_wrap_offsets(
+    positions: Sequence[float], *, gripper_index: Optional[int]
+) -> np.ndarray:
+    """Return arm-only +/-2pi startup offset corrections.
+
+    Arm joints are represented near zero after startup, but a gripper's
+    calibrated stroke may legitimately include positions above +pi.  Applying
+    the arm convention to the gripper makes its calibration depend on whether
+    it starts open or closed, so the gripper is deliberately excluded.
+    """
+    offsets = np.zeros(len(positions), dtype=float)
+    for idx, position in enumerate(positions):
+        if idx == gripper_index:
+            continue
+        if position < -np.pi:
+            offsets[idx] = -2 * np.pi
+        elif position > np.pi:
+            offsets[idx] = 2 * np.pi
+    return offsets
+
+
+def _select_gripper_branch_turns(
+    position: float,
+    limits: Sequence[float],
+    *,
+    tolerance_rad: float = _GRIPPER_BRANCH_TOLERANCE_RAD,
+) -> tuple[int, float]:
+    """Choose the equivalent 2*pi motor-coordinate branch for a gripper.
+
+    The DM feedback coordinate can restart on a neighbouring 2*pi branch.
+    Select the branch nearest the calibrated stroke midpoint, then reject a
+    position that is not plausibly inside the measured stroke.  The returned
+    position is in the calibrated motor-joint frame; it is not a command.
+    """
+    lo, hi = sorted(float(value) for value in limits)
+    midpoint = (lo + hi) / 2.0
+    turns = int(np.rint((midpoint - position) / (2.0 * np.pi)))
+    aligned_position = position + turns * 2.0 * np.pi
+    if not lo - tolerance_rad <= aligned_position <= hi + tolerance_rad:
+        raise RuntimeError(
+            "Gripper feedback is outside its calibrated stroke after 2*pi branch alignment: "
+            f"position={position:.4f}, aligned={aligned_position:.4f}, "
+            f"limits=[{lo:.4f}, {hi:.4f}]"
+        )
+    return turns, aligned_position
+
+
+def _align_gripper_startup_branch(
+    motor_chain: DMChainCanInterface,
+    gripper_index: int,
+    limits: Sequence[float],
+) -> tuple[int, float, float]:
+    """Align one gripper's software offset with its calibrated 2*pi branch.
+
+    ``absolute_positions`` must remain untouched because the driver updates it
+    from live feedback.  Updating the software offset instead keeps both
+    feedback and outgoing commands in the same continuous calibrated frame.
+    """
+    initial_position = float(motor_chain.read_states()[gripper_index].pos)
+    turns, aligned_position = _select_gripper_branch_turns(initial_position, limits)
+    if turns:
+        motor_chain.motor_offset[gripper_index] -= (
+            turns * 2.0 * np.pi * motor_chain.motor_direction[gripper_index]
+        )
+    return turns, initial_position, aligned_position
 
 
 def _load_joint_limits_from_xml(*xml_paths: str) -> np.ndarray:
@@ -177,6 +269,14 @@ def get_yam_robot(
     with_gripper = gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
 
+    # Per-arm calibration measured on the stable USB-CAN interfaces. These are
+    # raw, continuous motor-space endpoints [closed, open]; keeping them here
+    # prevents startup from re-running the physical calibration.
+    if with_gripper and gripper_limits_override is None:
+        calibrated = _calibrated_gripper_limits(channel)
+        if calibrated is not None:
+            gripper_limits_override = calibrated
+
     hw = _load_arm_config(arm_type)
     effective_gravity_comp = hw.gravity_comp_factor if gravity_comp_factor is None else gravity_comp_factor
     if with_gripper:
@@ -255,7 +355,9 @@ def get_yam_robot(
         channel,
         motor_chain_name="yam_real",
         receive_mode=ReceiveMode.p16,
-        start_thread=False,
+        # DMChain starts its command stream immediately after watchdog-safe
+        # bring-up, before this function performs offset bookkeeping.
+        start_thread=True,
         get_same_bus_device_driver=get_encoder_chain if with_teaching_handle else None,
         use_buffered_reader=False,
         enable_auto_recovery=enable_auto_recovery,
@@ -263,19 +365,35 @@ def get_yam_robot(
     motor_states = motor_chain.read_states()
     logging.debug(f"motor_states: {motor_states}")
 
-    logging.info(f"current_pos: {[m.pos for m in motor_states]}")
-    for idx, state in enumerate(motor_states):
-        if state.pos < -np.pi:
-            logging.info(f"motor {idx} pos={state.pos:.3f}, offset -2π")
-            motor_chain.motor_offset[idx] -= 2 * np.pi
-        elif state.pos > np.pi:
-            logging.info(f"motor {idx} pos={state.pos:.3f}, offset +2π")
-            motor_chain.motor_offset[idx] += 2 * np.pi
+    positions = [state.pos for state in motor_states]
+    logging.info(f"current_pos: {positions}")
+    gripper_index = n_arm_joints if with_gripper else None
+    startup_offsets = _startup_wrap_offsets(positions, gripper_index=gripper_index)
+    for idx, offset in enumerate(startup_offsets):
+        if offset < 0:
+            logging.info(f"motor {idx} pos={positions[idx]:.3f}, offset -2π")
+        elif offset > 0:
+            logging.info(f"motor {idx} pos={positions[idx]:.3f}, offset +2π")
+    motor_chain.motor_offset += startup_offsets
+
+    if gripper_index is not None and gripper_limits is not None:
+        turns, initial_gripper_position, aligned_gripper_position = _align_gripper_startup_branch(
+            motor_chain,
+            gripper_index,
+            gripper_limits,
+        )
+        logging.info(
+            "gripper %d startup branch: position=%.3f, turns=%+d, aligned=%.3f",
+            gripper_index,
+            initial_gripper_position,
+            turns,
+            aligned_gripper_position,
+        )
 
     logging.info(f"adjusted motor_offsets: {motor_chain.motor_offset.tolist()}")
 
-    # Start the control thread with corrected offsets.
-    motor_chain.start_thread()
+    # The command stream is already running; corrected offsets are now used
+    # by subsequent reads and commands.
     logging.info(f"YAM initial motor_states: {motor_chain.read_states()}")
 
     get_robot = partial(

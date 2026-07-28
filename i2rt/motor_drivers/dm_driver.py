@@ -149,53 +149,107 @@ class DMSingleMotorCanInterface(CanInterface):
         """Calculate the Control Frame ID for a given motor."""
         return self.cmd_idoffset + motor_id
 
-    def motor_on(self, motor_id: int, motor_type: str) -> None:
+    def _send_system_command(self, motor_id: int, data: List[int]) -> can.Message:
+        """Send one enable/disable/clear command and consume its one reply.
+
+        System commands share the MIT feedback ID. Retrying a send within one
+        transaction can therefore leave a delayed reply from the first send
+        indistinguishable from the reply to the second. Drain pre-existing
+        traffic, send exactly once, and use a bounded longer receive window.
+        Callers that need another attempt start a fresh transaction.
+        """
+        self._drain_bus(timeout_s=0.003, idle_count=1)
+        return self._send_message_get_response(
+            self._get_frame_id(motor_id),
+            motor_id,
+            data,
+            max_retry=1,
+            response_timeout=0.1,
+        )
+
+    def motor_on(self, motor_id: int, motor_type: str, max_retry: int = 2) -> FeedbackFrameInfo:
         """Turn on the motor.
 
         Args:
             motor_id (int): The ID of the motor to turn on.
         """
-        current_level = logging.getLogger().getEffectiveLevel()
-        logging.getLogger().setLevel(logging.ERROR)
-
-        id = motor_id  # self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFC]
 
-        message = self._send_message_get_response(id, motor_id, data)
+        # A factory 400 ms command watchdog leaves a replying motor in 0xD
+        # after commands stop.  This is distinct from a host receive failure,
+        # which raises AssertionError before parsing a response.
+        #
+        # Crucially, 0x0 is the normal *disabled* state, not a fault.  It must
+        # be retried with ENABLE (0xFC), never cleared with 0xFB.  In
+        # particular, sending several fire-and-forget 0xFB packets leaves
+        # same-motor feedback queued behind them, so a later 0xFC transaction
+        # can accidentally consume a stale disabled reply.
+        last_info = None
+        enable_attempts = max(1, max_retry + 1)
+        for attempt in range(enable_attempts):
+            try:
+                message = self._send_system_command(motor_id, data)
+            except AssertionError:
+                if attempt < enable_attempts - 1:
+                    logging.info(
+                        f"motor {motor_id} did not reply to enable; "
+                        f"retrying ({attempt + 1}/{enable_attempts - 1})"
+                    )
+                    continue
+                raise
+            motor_info = self.parse_recv_message(message, motor_type, ignore_error=True)
+            last_info = motor_info
+            error_code = int(motor_info.error_code, 16)
+            if error_code == MotorErrorCode.normal:
+                logging.info(f"motor {motor_id} is already on")
+                return motor_info
 
-        # dummy motor type just check motor status
-        motor_info = self.parse_recv_message(message, MotorType.DM4310, ignore_error=True)
-        if int(motor_info.error_code, 16) != MotorErrorCode.normal:
-            while int(motor_info.error_code, 16) != MotorErrorCode.normal:
-                logging.info(f"motor {motor_id} error: {motor_info.error_message}")
+            if error_code == MotorErrorCode.disabled and attempt < enable_attempts - 1:
+                # DaMiao's reference implementation waits after ENABLE before
+                # reading feedback.  On SocketCAN the acknowledgement can be
+                # the pre-transition state, so give the controller a bounded
+                # settle window and issue ENABLE again.  No fault is cleared.
+                logging.info(
+                    f"motor {motor_id} is disabled after enable; "
+                    f"retrying enable ({attempt + 1}/{enable_attempts - 1})"
+                )
+                time.sleep(0.05)
+                continue
+
+            if error_code == MotorErrorCode.loss_communication and attempt < enable_attempts - 1:
+                # 0xD is the documented command-watchdog state.  Clear it
+                # once transactionally (so its reply cannot poison the next
+                # enable), then retry.  Do not auto-clear any thermal,
+                # voltage, current, overload, or unknown status code.
+                logging.info(
+                    f"motor {motor_id} startup state {motor_info.error_message}; "
+                    f"clearing watchdog and retrying ({attempt + 1}/{enable_attempts - 1})"
+                )
                 self.clean_error(motor_id=motor_id)
-                self.try_receive_message()
-                logging.info(f"motor {motor_id} error cleaned")
-                # enable again
+                time.sleep(0.01)
+                continue
 
-                message = self._send_message_get_response(id, motor_id, data)
-                motor_info = self.parse_recv_message(message, motor_type, ignore_error=True)
-        else:
-            logging.info(f"motor {motor_id} is already on")
-        logging.getLogger().setLevel(current_level)
-        motor_info = self.parse_recv_message(message, motor_type)
-        return motor_info
+            raise RuntimeError(
+                f"motor {motor_id} refused enable: {motor_info.error_message} "
+                f"(MOS {motor_info.temperature_mos:.1f}C, "
+                f"rotor {motor_info.temperature_rotor:.1f}C)"
+            )
 
-    def clean_error(self, motor_id: int) -> None:
-        # self.try_receive_message()
-        id = motor_id  # self._get_frame_id(motor_id)
+        # Kept for type checkers; the loop either returns or raises.
+        assert last_info is not None
+        raise RuntimeError(f"motor {motor_id} failed to enable")
+
+    def clean_error(self, motor_id: int) -> FeedbackFrameInfo:
+        """Send one clear-fault command and consume its matching feedback.
+
+        Clear Error (0xFB) is only appropriate for a documented recoverable
+        fault such as the command watchdog.  Keeping it transactional avoids
+        queuing same-motor feedback that a later command could misassociate.
+        """
         data = [0xFF] * 7 + [0xFB]
         logging.info("clear error")
-        message = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False)
-        for _ in range(3):
-            try:
-                self.bus.send(message)
-            except Exception as e:
-                logging.warning(e)
-                logging.warning(
-                    "\033[91m" + "CAN Error: Failed to communicate with motor over can bus. Retrying..." + "\033[0m"
-                )
-        # message = self._send_message_get_response(id, data)
+        message = self._send_system_command(motor_id, data)
+        return self.parse_recv_message(message, MotorType.DM4310, ignore_error=True)
 
     def motor_off(self, motor_id: int) -> None:
         """Turn off the motor.
@@ -235,6 +289,7 @@ class DMSingleMotorCanInterface(CanInterface):
         kp: float,
         kd: float,
         torque: float,
+        max_retry: int = 15,
     ) -> FeedbackFrameInfo:
         """Set the control of the motor and return its status.
 
@@ -278,7 +333,7 @@ class DMSingleMotorCanInterface(CanInterface):
             data[0:4] = can_data[0:4]
 
         # Send the CAN message
-        message = self._send_message_get_response(frame_id, motor_id, data, max_retry=15)
+        message = self._send_message_get_response(frame_id, motor_id, data, max_retry=max_retry)
 
         # Parse the received message to extract motor information
         motor_info = self.parse_recv_message(message, motor_type)
@@ -437,6 +492,15 @@ class DMChainCanInterface(MotorChain):
 
         self.state = None
         self.state_lock = threading.Lock()
+        # These must exist before any actuator is enabled.  _motor_on() uses
+        # zero-torque MIT keepalives while it brings motors up serially.
+        self.command_lock = threading.RLock()
+        self.commands = [MotorCmd() for _ in self.motor_list]
+        self.start_thread_flag = False
+        self._control_thread: Optional[threading.Thread] = None
+        self._first_command_sent = threading.Event()
+        self._control_error: Optional[BaseException] = None
+        self.running = False
         self._report_interval = report_interval
         self._rate_recorder = RateRecorder(name=self, report_interval=report_interval)
 
@@ -456,14 +520,7 @@ class DMChainCanInterface(MotorChain):
 
             self.absolute_positions = None
             self._motor_on()
-        starting_command = []
-        for motor_state in self.state:
-            starting_command.append(MotorCmd(torque=motor_state.torque))
-        logging.info(f"Initializing motorchain with starting command: {starting_command}")
-        self.commands = starting_command
-        self.command_lock = threading.RLock()
-
-        self.start_thread_flag = False
+        logging.info(f"Initializing motorchain with starting command: {self.commands}")
         if start_thread:
             self.start_thread()
 
@@ -517,13 +574,56 @@ class DMChainCanInterface(MotorChain):
     def _joint_position_sim_to_real_idx(self, joint_position_sim: float, idx: int) -> float:
         return joint_position_sim * self.motor_direction[idx] + self.motor_offset[idx]
 
+    def _send_startup_keepalive(self, motor_feedback: List[FeedbackFrameInfo], indices: List[int]) -> None:
+        """Feed already-enabled motors while the remaining chain starts.
+
+        This is deliberately a zero-torque MIT command at the motor's current
+        raw position.  It satisfies the 400 ms command watchdog without
+        creating a position step or reusing stale feedback torque.
+        """
+        for idx in indices:
+            motor_id, motor_type = self.motor_list[idx]
+            state = motor_feedback[idx]
+            motor_feedback[idx] = self.motor_interface.set_control(
+                motor_id=motor_id,
+                motor_type=motor_type,
+                pos=state.position,
+                vel=0.0,
+                kp=0.0,
+                kd=0.0,
+                torque=0.0,
+                max_retry=1,
+            )
+
+    def _best_effort_motor_off(self, motor_indices: List[int]) -> None:
+        """Disable known-enabled motors without masking the original failure."""
+        for idx in reversed(motor_indices):
+            motor_id, _ = self.motor_list[idx]
+            try:
+                self.motor_interface.motor_off(motor_id)
+            except Exception as exc:
+                logging.warning("Failed to disable motor %s during cleanup: %s", motor_id, exc)
+
     def _motor_on(self) -> None:
-        motor_feedback = []
+        motor_feedback: List[FeedbackFrameInfo] = []
+        enabled_indices: List[int] = []
         self.motor_interface._drain_bus(timeout_s=0.05)
-        for motor_id, motor_type in self.motor_list:
-            logging.info(f"Turning on motor_id: {motor_id}, motor_type: {motor_type}")
-            time.sleep(0.003)
-            motor_feedback.append(self.motor_interface.motor_on(motor_id, motor_type))
+        try:
+            for idx, (motor_id, motor_type) in enumerate(self.motor_list):
+                # Refresh all earlier motors before a potentially blocking
+                # enable transaction for the next motor.
+                if enabled_indices:
+                    self._send_startup_keepalive(motor_feedback, enabled_indices)
+                logging.info(f"Turning on motor_id: {motor_id}, motor_type: {motor_type}")
+                time.sleep(0.003)
+                motor_feedback.append(self.motor_interface.motor_on(motor_id, motor_type, max_retry=2))
+                enabled_indices.append(idx)
+                # The newly enabled motor must receive a MIT command before
+                # startup proceeds to any other motor.
+                self._send_startup_keepalive(motor_feedback, [idx])
+        except Exception:
+            self._best_effort_motor_off(enabled_indices)
+            raise
         self._update_absolute_positions(motor_feedback)
         self.state = motor_feedback
         self.running = True
@@ -532,13 +632,16 @@ class DMChainCanInterface(MotorChain):
         if self.start_thread_flag:
             return
         logging.info("starting separate thread for control loop")
-        thread = threading.Thread(target=self._set_torques_and_update_state)
-        thread.start()
         self.start_thread_flag = True
-        time.sleep(0.1)
-        while self.state is None:
-            time.sleep(0.1)
-            logging.info("waiting for the first state")
+        self._first_command_sent.clear()
+        thread = threading.Thread(target=self._set_torques_and_update_state, name=f"{self}-control", daemon=True)
+        self._control_thread = thread
+        thread.start()
+        if not self._first_command_sent.wait(timeout=0.25):
+            self.running = False
+            thread.join(timeout=0.25)
+            detail = f": {self._control_error}" if self._control_error is not None else ""
+            raise RuntimeError(f"{self}: no complete startup command sweep within 250 ms{detail}")
 
     def _set_torques_and_update_state(self) -> None:
         """
@@ -605,6 +708,7 @@ class DMChainCanInterface(MotorChain):
                     with self.state_lock:
                         self.state = motor_feedback
                         self._update_absolute_positions(motor_feedback)
+                    self._first_command_sent.set()
                     if self.same_bus_device_driver is not None:
                         time.sleep(0.001)
                         with self.same_bus_device_lock:
@@ -614,32 +718,52 @@ class DMChainCanInterface(MotorChain):
                     self._rate_recorder.track()
                 except Exception as e:
                     print(f"DM Error in control loop: {e}")
+                    self._control_error = e
                     self.running = False
                     raise e
 
     def _try_recover_motors(self, motor_feedback: Optional[List[MotorInfo]] = None, max_retries: int = 3) -> bool:
-        """Attempt to recover motors that report errors.
+        """Recover only documented CAN-watchdog faults.
 
-        For each motor with an error, clean the error and re-enable.
-        Returns True if ALL motors recovered successfully, False otherwise.
+        A fault status is not permission to clear and re-enable a motor.  In
+        particular, calibration, current, voltage, overload, and thermal
+        faults must remain latched for operator diagnosis.  We can only
+        recover a structured ``0xD`` feedback status, which is the factory
+        CAN command watchdog and is handled transactionally by ``motor_on``.
         """
+        if motor_feedback is None:
+            logging.warning("Skipping automatic motor recovery without structured feedback")
+            return False
+
+        error_indices = [i for i, fb in enumerate(motor_feedback) if fb.error_code != "0x1"]
+        if not error_indices:
+            return True
+
+        unsafe_faults = [
+            (idx, motor_feedback[idx].error_code)
+            for idx in error_indices
+            if int(motor_feedback[idx].error_code, 16) != MotorErrorCode.loss_communication
+        ]
+        if unsafe_faults:
+            logging.error(
+                "Refusing automatic recovery for non-watchdog motor faults: %s",
+                unsafe_faults,
+            )
+            return False
+
         for attempt in range(max_retries):
-            # Determine which motors need recovery
-            if motor_feedback is not None:
-                error_indices = [i for i, fb in enumerate(motor_feedback) if fb.error_code != "0x1"]
-            else:
-                error_indices = list(range(len(self.motor_list)))
-
-            if not error_indices:
-                return True
-
             for idx in error_indices:
                 motor_id, motor_type = self.motor_list[idx]
-                logging.warning(f"Recovering motor {motor_id} ({motor_type}), attempt {attempt + 1}/{max_retries}")
-                self.motor_interface.clean_error(motor_id)
-                time.sleep(0.003)
-                self.motor_interface.try_receive_message(timeout=0.002)
+                logging.warning(
+                    "Recovering watchdog state on motor %s (%s), attempt %s/%s",
+                    motor_id,
+                    motor_type,
+                    attempt + 1,
+                    max_retries,
+                )
                 try:
+                    # ``motor_on`` clears only a 0xD watchdog status, consumes
+                    # each reply transactionally, then re-enables the motor.
                     self.motor_interface.motor_on(motor_id, motor_type)
                 except Exception as e:
                     logging.warning(f"Motor {motor_id} re-enable failed: {e}")
@@ -680,6 +804,7 @@ class DMChainCanInterface(MotorChain):
                     kp=kp,
                     kd=kd,
                     torque=torque,
+                    max_retry=2,
                 )
             except Exception as e:
                 logging.error(f"{idx}th motor at DMChainCanInterface {self} failed with info {motor_info}")
@@ -748,6 +873,12 @@ class DMChainCanInterface(MotorChain):
 
     def close(self) -> None:
         self.running = False
+        if self._control_thread is not None and self._control_thread is not threading.current_thread():
+            self._control_thread.join(timeout=1.0)
+        # A graceful shutdown must explicitly disable motors.  Otherwise the
+        # factory watchdog converts an ordinary process exit into a latched
+        # 0xD state that blocks the next startup.
+        self._best_effort_motor_off(list(range(len(self.motor_list))))
         self.motor_interface.close()
 
 

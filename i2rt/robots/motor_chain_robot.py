@@ -136,7 +136,10 @@ class MotorChainRobot(Robot):
                 logger = logging.getLogger(__name__)
                 logger.info(f"Using provided gripper limits: {gripper_limits}")
 
-        self._last_gripper_command_qpos = 1  # initialize as fully open
+        # Filled from the first encoder sample below.  This value is in raw
+        # motor-joint space, so a literal normalized ``1`` is not correct for
+        # calibrated grippers whose open endpoint is a different radian value.
+        self._last_gripper_command_qpos = 0.0
         assert clip_motor_torque >= 0.0
         self._clip_motor_torque = clip_motor_torque
         self.motor_chain = motor_chain
@@ -233,6 +236,10 @@ class MotorChainRobot(Robot):
             # wait to recive joint data
             time.sleep(0.05)
             self._joint_state = self._motor_state_to_joint_state(self.motor_chain.read_states())
+        if self._gripper_index is not None:
+            self._last_gripper_command_qpos = float(
+                self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[self._gripper_index]
+            )
         self._commands = JointCommands.init_all_zero(len(motor_chain))
         if zero_gravity_mode:
             self._commands.kd = self._grav_comp_kd.copy()

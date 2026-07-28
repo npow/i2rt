@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 # 0 maps to the first (closed) endpoint and command 1 maps to the second
 # (open) endpoint.
 _LEFT_LINEAR_4310_RAW_LIMITS = np.array([6.325055, 1.234264], dtype=float)
-_RIGHT_LINEAR_4310_RAW_LIMITS = np.array([1.235790, 6.322004], dtype=float)
+# Confirmed against the physical right gripper: raw ~=6.285 is fully closed.
+# Policy convention remains 0=closed, 1=open, so this arm has the same raw
+# endpoint ordering as the left one even though an earlier calibration label
+# had these two values swapped.
+_RIGHT_LINEAR_4310_RAW_LIMITS = np.array([6.322004, 1.235790], dtype=float)
 _GRIPPER_BRANCH_TOLERANCE_RAD = 0.25
 
 

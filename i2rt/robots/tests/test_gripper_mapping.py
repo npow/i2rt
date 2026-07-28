@@ -42,7 +42,7 @@ def test_gripper_startup_selects_the_calibrated_2pi_branch() -> None:
 def test_right_gripper_calibration_matches_measured_endpoints() -> None:
     limits = _calibrated_gripper_limits("can_right")
     assert limits is not None
-    np.testing.assert_allclose(limits, [1.235790, 6.322004], atol=1e-6)
+    np.testing.assert_allclose(limits, [6.322004, 1.235790], atol=1e-6)
 
     mapper = JointMapper({6: limits}, total_dofs=7)
     command = np.zeros(7)

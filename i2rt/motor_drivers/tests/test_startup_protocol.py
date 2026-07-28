@@ -59,8 +59,8 @@ def test_startup_retries_disabled_without_clearing_a_fault():
     assert commands == [0xFC, 0xFC]
 
 
-def test_startup_recovers_documented_watchdog_status_transactionally_but_not_thermal_fault():
-    def run(statuses):
+def test_startup_recovers_watchdog_and_only_cold_latched_thermal_statuses():
+    def run(statuses, *, temperature=25.0):
         interface = object.__new__(DMSingleMotorCanInterface)
         commands = []
 
@@ -72,7 +72,16 @@ def test_startup_recovers_documented_watchdog_status_transactionally_but_not_the
 
         def parse(*args, **kwargs):
             code = statuses.pop(0)
-            return FeedbackFrameInfo(1, hex(code), "test", 0.0, 0.0, 0.0, 25.0, 25.0)
+            return FeedbackFrameInfo(
+                1,
+                hex(code),
+                "test",
+                0.0,
+                0.0,
+                0.0,
+                temperature,
+                temperature,
+            )
 
         interface.parse_recv_message = parse
         try:
@@ -89,7 +98,36 @@ def test_startup_recovers_documented_watchdog_status_transactionally_but_not_the
         "enabled",
         [0xFC, 0xFB, 0xFC],
     )
-    assert run([MotorErrorCode.motor_over_temperature]) == ("rejected", [0xFC])
+    # DaMiao's 0xFB Clear Error is valid for thermal faults.  A status at
+    # ambient temperature is a historical/latching condition, so clear it
+    # once and require a clean subsequent enable reply.
+    assert run(
+        [
+            MotorErrorCode.motor_over_temperature,
+            MotorErrorCode.disabled,
+            MotorErrorCode.normal,
+        ]
+    ) == ("enabled", [0xFC, 0xFB, 0xFC])
+    assert run(
+        [
+            MotorErrorCode.mosfet_over_temperature,
+            MotorErrorCode.disabled,
+            MotorErrorCode.normal,
+        ]
+    ) == ("enabled", [0xFC, 0xFB, 0xFC])
+    # Do not clear a genuinely warm motor, or loop clearing a status that
+    # returns after the one allowed fault reset.
+    assert run([MotorErrorCode.motor_over_temperature], temperature=61.0) == (
+        "rejected",
+        [0xFC],
+    )
+    assert run(
+        [
+            MotorErrorCode.motor_over_temperature,
+            MotorErrorCode.motor_over_temperature,
+            MotorErrorCode.motor_over_temperature,
+        ]
+    ) == ("rejected", [0xFC, 0xFB, 0xFC])
 
 
 def test_system_command_sends_once_after_drain_with_longer_reply_window():
@@ -144,3 +182,40 @@ def test_output_shaft_calibration_fault_is_named_and_never_auto_cleared():
 
     assert chain._try_recover_motors(feedback) is False
     assert chain.motor_interface.enabled == []
+
+
+def test_chain_startup_failure_releases_its_can_interface():
+    """A failed constructor must not strand the SocketCAN ownership lock."""
+
+    created = []
+
+    class _FailingInterface:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            created.append(self)
+
+        def _drain_bus(self, **kwargs):
+            return 0
+
+        def motor_on(self, *args, **kwargs):
+            raise RuntimeError("expected startup failure")
+
+        def close(self):
+            self.closed = True
+
+    with patch("i2rt.motor_drivers.dm_driver.DMSingleMotorCanInterface", _FailingInterface):
+        try:
+            DMChainCanInterface(
+                motor_list=[(1, MotorType.DM4310)],
+                motor_offset=[0.0],
+                motor_direction=[1.0],
+                channel="fake",
+                start_thread=False,
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "expected startup failure"
+        else:  # pragma: no cover - test assertion
+            raise AssertionError("expected DMChainCanInterface startup to fail")
+
+    assert len(created) == 1
+    assert created[0].closed is True

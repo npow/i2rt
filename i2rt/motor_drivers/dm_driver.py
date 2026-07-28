@@ -34,6 +34,14 @@ CONTROL_PERIOD = 1.0 / CONTROL_FREQ  # 4 ms
 EXPECTED_CONTROL_PERIOD = 0.007
 REPORT_INTERVAL = 30.0
 
+# DaMiao's configurable over-temperature trip point cannot be lower than
+# 80 C.  A thermal-status bit accompanied by temperatures at or below 60 C is
+# therefore not an active thermal condition on a conforming controller: it is
+# a latched historical fault (or a controller/sensor fault).  Startup may
+# clear that narrow case *once* and re-check it; every genuinely warm, voltage,
+# current, calibration, overload, or unknown fault remains fail-closed.
+LATCHED_THERMAL_CLEAR_MAX_C = 60.0
+
 
 class ControlMode:
     MIT = "MIT"
@@ -185,6 +193,7 @@ class DMSingleMotorCanInterface(CanInterface):
         # same-motor feedback queued behind them, so a later 0xFC transaction
         # can accidentally consume a stale disabled reply.
         last_info = None
+        thermal_clear_attempted = False
         enable_attempts = max(1, max_retry + 1)
         for attempt in range(enable_attempts):
             try:
@@ -228,6 +237,37 @@ class DMSingleMotorCanInterface(CanInterface):
                 self.clean_error(motor_id=motor_id)
                 time.sleep(0.01)
                 continue
+
+            if error_code in {
+                MotorErrorCode.mosfet_over_temperature,
+                MotorErrorCode.motor_over_temperature,
+            }:
+                hottest_temperature = max(
+                    motor_info.temperature_mos,
+                    motor_info.temperature_rotor,
+                )
+                if (
+                    hottest_temperature <= LATCHED_THERMAL_CLEAR_MAX_C
+                    and not thermal_clear_attempted
+                    and attempt < enable_attempts - 1
+                ):
+                    # The controller reports the *current* temperatures in
+                    # the same frame as its latched status.  Only a cold
+                    # thermal bit is cleared, exactly once, then the next
+                    # enable reply is treated as the source of truth.  Clear
+                    # Error itself is not a position/control command.
+                    logging.warning(
+                        "motor %s has a latched thermal status (%s) at "
+                        "MOS %.1fC / rotor %.1fC; clearing once and rechecking",
+                        motor_id,
+                        motor_info.error_message,
+                        motor_info.temperature_mos,
+                        motor_info.temperature_rotor,
+                    )
+                    self.clean_error(motor_id=motor_id)
+                    thermal_clear_attempted = True
+                    time.sleep(0.02)
+                    continue
 
             raise RuntimeError(
                 f"motor {motor_id} refused enable: {motor_info.error_message} "
@@ -507,19 +547,29 @@ class DMChainCanInterface(MotorChain):
         self.same_bus_device_states = None
         self.same_bus_device_lock = threading.Lock()
 
-        with self.same_bus_device_lock:
-            if get_same_bus_device_driver is not None:
-                self.same_bus_device_driver = get_same_bus_device_driver(self.motor_interface)
-            else:
-                self.same_bus_device_driver = None
+        try:
+            with self.same_bus_device_lock:
+                if get_same_bus_device_driver is not None:
+                    self.same_bus_device_driver = get_same_bus_device_driver(self.motor_interface)
+                else:
+                    self.same_bus_device_driver = None
 
-            if self.same_bus_device_driver is not None:
-                drained = self.motor_interface._drain_bus(timeout_s=0.2)
-                if drained:
-                    logging.info(f"Drained {drained} stale frames before motor bring-up")
+                if self.same_bus_device_driver is not None:
+                    drained = self.motor_interface._drain_bus(timeout_s=0.2)
+                    if drained:
+                        logging.info(f"Drained {drained} stale frames before motor bring-up")
 
-            self.absolute_positions = None
-            self._motor_on()
+                self.absolute_positions = None
+                self._motor_on()
+        except Exception:
+            # A constructor failure otherwise leaves the SocketCAN fd and its
+            # single-controller lock to garbage collection.  The next
+            # launcher then sees a misleading busy/stale CAN channel.
+            try:
+                self.motor_interface.close()
+            except Exception as close_exc:  # noqa: BLE001 -- retain startup root cause
+                logging.warning("Failed to close CAN after startup failure: %s", close_exc)
+            raise
         logging.info(f"Initializing motorchain with starting command: {self.commands}")
         if start_thread:
             self.start_thread()

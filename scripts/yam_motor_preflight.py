@@ -6,15 +6,19 @@ records its feedback, and immediately disables it again.  It never sends a
 joint-position target, writes calibration/zero registers, or opens cameras.
 
 The motor interface may transactionally clear the documented ``0xD`` CAN
-watchdog state so that a powered-but-idle arm can report its health.  All
-other faults, especially calibration faults, remain fail-closed.
+watchdog state so that a powered-but-idle arm can report its health.  A
+latched output-shaft calibration status is also cleared automatically (the
+driver's startup default): at most once per motor, requiring a fresh normal
+enable reply and a position that is continuous across the clear.  Pass
+``--no-clear-latched-calibration`` to keep calibration faults fail-closed.
 """
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
-from typing import List
+from typing import Annotated
+
+import tyro
 
 from i2rt.motor_drivers.dm_driver import ControlMode, DMSingleMotorCanInterface
 from i2rt.robots.utils import ArmType, GripperType, _load_arm_config
@@ -29,7 +33,7 @@ class Result:
     detail: str
 
 
-def configured_motors() -> List[tuple[int, str]]:
+def configured_motors() -> list[tuple[int, str]]:
     arm = _load_arm_config(ArmType.YAM)
     gripper_motor_type = GripperType.LINEAR_4310.get_motor_type(ArmType.YAM)
     return [(int(motor_id), str(motor_type)) for motor_id, motor_type in arm.motor_list] + [
@@ -37,19 +41,24 @@ def configured_motors() -> List[tuple[int, str]]:
     ]
 
 
-def probe_channel(channel: str) -> List[Result]:
+def probe_channel(channel: str, *, clear_latched_calibration: bool = True) -> list[Result]:
     interface = DMSingleMotorCanInterface(
         channel=channel,
         bustype="socketcan",
         control_mode=ControlMode.MIT,
         name=f"yam-preflight-{channel}",
     )
-    results: List[Result] = []
+    results: list[Result] = []
     try:
         for motor_id, motor_type in configured_motors():
             enabled = False
             try:
-                feedback = interface.motor_on(motor_id, motor_type, max_retry=2)
+                feedback = interface.motor_on(
+                    motor_id,
+                    motor_type,
+                    max_retry=2,
+                    clear_latched_calibration=clear_latched_calibration,
+                )
                 enabled = True
                 # Feed one explicit zero-torque command at the motor's live
                 # position before disabling it.  This never requests motion
@@ -92,16 +101,31 @@ def probe_channel(channel: str) -> List[Result]:
     return results
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("channels", nargs="*", default=["can_left", "can_right"])
-    args = parser.parse_args()
+def main(
+    channels: Annotated[list[str] | None, tyro.conf.Positional] = None,
+    clear_latched_calibration: bool = True,
+) -> int:
+    """Probe YAM motors without commanding motion.
 
-    all_results: List[Result] = []
-    for channel in args.channels:
+    Args:
+        channels: SocketCAN channels to probe.
+        clear_latched_calibration: Clear each output-shaft calibration status
+            at most once, then require a fresh normal enable reply with a
+            position continuous across the clear (the driver's default).
+    """
+    if channels is None:
+        channels = ["can_left", "can_right"]
+
+    all_results: list[Result] = []
+    for channel in channels:
         print(f"\n=== {channel}: enable/read/disable each motor ===")
         try:
-            all_results.extend(probe_channel(channel))
+            all_results.extend(
+                probe_channel(
+                    channel,
+                    clear_latched_calibration=clear_latched_calibration,
+                )
+            )
         except Exception as exc:
             all_results.append(Result(channel, -1, "n/a", "CHANNEL_ERROR", str(exc)))
 
@@ -115,4 +139,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(tyro.cli(main))

@@ -42,6 +42,13 @@ REPORT_INTERVAL = 30.0
 # current, calibration, overload, or unknown fault remains fail-closed.
 LATCHED_THERMAL_CLEAR_MAX_C = 60.0
 
+# A cleared calibration status is only trusted if the motor's reported
+# position is continuous across the clear: a genuinely lost output-shaft
+# calibration shows up as a position jump, a spuriously re-latched boot flag
+# does not (the YAM right arm re-asserts 0x3 on motors 4/7 at every power-on
+# with a provably steady encoder).
+CALIBRATION_CLEAR_MAX_POSITION_JUMP_RAD = 0.2
+
 
 class ControlMode:
     MIT = "MIT"
@@ -175,7 +182,13 @@ class DMSingleMotorCanInterface(CanInterface):
             response_timeout=0.1,
         )
 
-    def motor_on(self, motor_id: int, motor_type: str, max_retry: int = 2) -> FeedbackFrameInfo:
+    def motor_on(
+        self,
+        motor_id: int,
+        motor_type: str,
+        max_retry: int = 2,
+        clear_latched_calibration: bool = True,
+    ) -> FeedbackFrameInfo:
         """Turn on the motor.
 
         Args:
@@ -194,6 +207,7 @@ class DMSingleMotorCanInterface(CanInterface):
         # can accidentally consume a stale disabled reply.
         last_info = None
         thermal_clear_attempted = False
+        calibration_fault_position: Optional[float] = None
         enable_attempts = max(1, max_retry + 1)
         for attempt in range(enable_attempts):
             try:
@@ -210,6 +224,22 @@ class DMSingleMotorCanInterface(CanInterface):
             last_info = motor_info
             error_code = int(motor_info.error_code, 16)
             if error_code == MotorErrorCode.normal:
+                if calibration_fault_position is not None:
+                    position_jump = abs(motor_info.position - calibration_fault_position)
+                    if position_jump > CALIBRATION_CLEAR_MAX_POSITION_JUMP_RAD:
+                        raise RuntimeError(
+                            f"motor {motor_id} position jumped {position_jump:.3f} rad "
+                            f"across a calibration-status clear "
+                            f"({calibration_fault_position:.3f} -> {motor_info.position:.3f}); "
+                            "the output-shaft calibration is genuinely lost — do not "
+                            "run this arm before recalibrating the joint"
+                        )
+                    logging.warning(
+                        "motor %s enabled after auto-clearing a latched calibration "
+                        "status; position steady at %.3f rad",
+                        motor_id,
+                        motor_info.position,
+                    )
                 logging.info(f"motor {motor_id} is already on")
                 return motor_info
 
@@ -236,6 +266,29 @@ class DMSingleMotorCanInterface(CanInterface):
                 )
                 self.clean_error(motor_id=motor_id)
                 time.sleep(0.01)
+                continue
+
+            if (
+                error_code == MotorErrorCode.output_shaft_calibration
+                and clear_latched_calibration
+                and calibration_fault_position is None
+                and attempt < enable_attempts - 1
+            ):
+                # Some YAM motors re-latch this status at every power-on with
+                # a perfectly healthy encoder, so startup clears it at most
+                # once.  Two guards keep a real calibration loss fail-closed:
+                # the fresh enable must report normal (a recurring fault is
+                # never cleared again), and the reported position must be
+                # continuous across the clear (checked at the normal-return
+                # path above).
+                logging.warning(
+                    "motor %s has a latched output-shaft calibration status; "
+                    "clearing once and rechecking",
+                    motor_id,
+                )
+                calibration_fault_position = motor_info.position
+                self.clean_error(motor_id=motor_id)
+                time.sleep(0.02)
                 continue
 
             if error_code in {
@@ -812,9 +865,13 @@ class DMChainCanInterface(MotorChain):
                     max_retries,
                 )
                 try:
-                    # ``motor_on`` clears only a 0xD watchdog status, consumes
-                    # each reply transactionally, then re-enables the motor.
-                    self.motor_interface.motor_on(motor_id, motor_type)
+                    # Mid-run recovery is stricter than startup: only the 0xD
+                    # watchdog status may be cleared here.  A calibration
+                    # status appearing while the arm is live is never
+                    # auto-cleared, even though startup handles it.
+                    self.motor_interface.motor_on(
+                        motor_id, motor_type, clear_latched_calibration=False
+                    )
                 except Exception as e:
                     logging.warning(f"Motor {motor_id} re-enable failed: {e}")
                     continue

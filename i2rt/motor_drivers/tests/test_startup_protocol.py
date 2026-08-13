@@ -59,10 +59,11 @@ def test_startup_retries_disabled_without_clearing_a_fault():
     assert commands == [0xFC, 0xFC]
 
 
-def test_startup_recovers_watchdog_and_only_cold_latched_thermal_statuses():
-    def run(statuses, *, temperature=25.0):
+def test_startup_recovers_watchdog_and_only_explicitly_allowed_latched_statuses():
+    def run(statuses, *, temperature=25.0, positions=None, clear_latched_calibration=None):
         interface = object.__new__(DMSingleMotorCanInterface)
         commands = []
+        positions = list(positions) if positions is not None else [0.0] * len(statuses)
 
         def send(_motor_id, data):
             commands.append(data[-1])
@@ -76,7 +77,7 @@ def test_startup_recovers_watchdog_and_only_cold_latched_thermal_statuses():
                 1,
                 hex(code),
                 "test",
-                0.0,
+                positions.pop(0),
                 0.0,
                 0.0,
                 temperature,
@@ -84,9 +85,12 @@ def test_startup_recovers_watchdog_and_only_cold_latched_thermal_statuses():
             )
 
         interface.parse_recv_message = parse
+        kwargs = {}
+        if clear_latched_calibration is not None:
+            kwargs["clear_latched_calibration"] = clear_latched_calibration
         try:
             with patch("i2rt.motor_drivers.dm_driver.time.sleep"):
-                interface.motor_on(1, MotorType.DM4310)
+                interface.motor_on(1, MotorType.DM4310, **kwargs)
                 outcome = "enabled"
         except RuntimeError:
             outcome = "rejected"
@@ -128,6 +132,48 @@ def test_startup_recovers_watchdog_and_only_cold_latched_thermal_statuses():
             MotorErrorCode.motor_over_temperature,
         ]
     ) == ("rejected", [0xFC, 0xFB, 0xFC])
+    # A spuriously re-latched boot calibration status is cleared automatically
+    # at startup: at most once, and the following enable must be clean with a
+    # position that is continuous across the clear.
+    assert run(
+        [
+            MotorErrorCode.output_shaft_calibration,
+            MotorErrorCode.disabled,
+            MotorErrorCode.normal,
+        ]
+    ) == ("enabled", [0xFC, 0xFB, 0xFC])
+    # Opting out restores fail-closed behavior (used by mid-run recovery).
+    assert run(
+        [MotorErrorCode.output_shaft_calibration],
+        clear_latched_calibration=False,
+    ) == ("rejected", [0xFC])
+    # A calibration status that returns after the one allowed clear is real.
+    assert run(
+        [
+            MotorErrorCode.output_shaft_calibration,
+            MotorErrorCode.disabled,
+            MotorErrorCode.output_shaft_calibration,
+        ]
+    ) == ("rejected", [0xFC, 0xFB, 0xFC])
+    # A position jump across the clear means the calibration is genuinely
+    # lost; the motor must not be reported healthy.
+    assert run(
+        [
+            MotorErrorCode.output_shaft_calibration,
+            MotorErrorCode.disabled,
+            MotorErrorCode.normal,
+        ],
+        positions=[0.1, 0.1, 1.5],
+    ) == ("rejected", [0xFC, 0xFB, 0xFC])
+    # The healthy case reports a steady position and enables.
+    assert run(
+        [
+            MotorErrorCode.output_shaft_calibration,
+            MotorErrorCode.disabled,
+            MotorErrorCode.normal,
+        ],
+        positions=[-0.096, -0.096, -0.096],
+    ) == ("enabled", [0xFC, 0xFB, 0xFC])
 
 
 def test_system_command_sends_once_after_drain_with_longer_reply_window():

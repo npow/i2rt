@@ -1,0 +1,5 @@
+# GELLO U2D2 adapters connected to this machine.
+# Match the exact FTDI serial numbers so unrelated FT232H devices keep their
+# default ownership. npow is already an active member of plugdev.
+SUBSYSTEM=="tty", ACTION=="add|change", ATTRS{serial}=="FTBEQC10", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="tty", ACTION=="add|change", ATTRS{serial}=="FTBEQBRC", GROUP="plugdev", MODE="0660"

@@ -93,3 +93,5 @@ i2rt.egg-info/
 scripts/temp_*/
 
 *.mjb
+# MuJoCo scratch log, written on every sim run
+MUJOCO_LOG.TXT
